@@ -1,13 +1,9 @@
 package main
 
 import (
-	"fmt"
 	"io"
-	"mime"
 	"net/http"
 	"os"
-	"path/filepath"
-	"strings"
 
 	"github.com/bootdotdev/learn-file-storage-s3-golang-starter/internal/auth"
 	"github.com/google/uuid"
@@ -34,11 +30,7 @@ func (cfg *apiConfig) handlerUploadThumbnail(w http.ResponseWriter, r *http.Requ
 	}
 
 	const maxMemory = 10 << 20 // 10 MB
-	err = r.ParseMultipartForm(maxMemory)
-	if err != nil {
-		respondWithError(w, http.StatusBadRequest, "Unable to parse multipart form", err)
-		return
-	}
+	r.ParseMultipartForm(maxMemory)
 
 	file, header, err := r.FormFile("thumbnail")
 	if err != nil {
@@ -47,21 +39,31 @@ func (cfg *apiConfig) handlerUploadThumbnail(w http.ResponseWriter, r *http.Requ
 	}
 	defer file.Close()
 
-	// Parse the Content-Type header to ignore optional parameters like charsets
-	mediaType, _, err := mime.ParseMediaType(header.Header.Get("Content-Type"))
-	if err != nil {
-		respondWithError(w, http.StatusBadRequest, "Invalid Content-Type header", err)
+	mediaType := header.Header.Get("Content-Type")
+	if mediaType == "" {
+		respondWithError(w, http.StatusBadRequest, "Missing Content-Type for thumbnail", nil)
 		return
 	}
 
-	// Determine the corresponding file extensions for the media type
-	extensions, err := mime.ExtensionsByType(mediaType)
-	if err != nil || len(extensions) == 0 {
-		respondWithError(w, http.StatusBadRequest, "Unsupported media type extension", err)
+	// Use the safer parsing tool integrated into the asset helper
+	assetPath, err := getAssetPath(videoID, mediaType)
+	if err != nil {
+		respondWithError(w, http.StatusBadRequest, "Invalid media type or extension", err)
 		return
 	}
-	// Take the first matching extension and remove the leading dot if present
-	fileExt := strings.TrimPrefix(extensions[0], ".")
+	assetDiskPath := cfg.getAssetDiskPath(assetPath)
+
+	dst, err := os.Create(assetDiskPath)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Unable to create file on server", err)
+		return
+	}
+	defer dst.Close()
+
+	if _, err = io.Copy(dst, file); err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Error saving file", err)
+		return
+	}
 
 	video, err := cfg.db.GetVideo(videoID)
 	if err != nil {
@@ -73,32 +75,11 @@ func (cfg *apiConfig) handlerUploadThumbnail(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	// Construct the unique local disk file path
-	fileName := fmt.Sprintf("%s.%s", videoID, fileExt)
-	filePath := filepath.Join(cfg.assetsRoot, fileName)
-
-	// Create the empty file on disk
-	dstFile, err := os.Create(filePath)
-	if err != nil {
-		respondWithError(w, http.StatusInternalServerError, "Unable to create file on disk", err)
-		return
-	}
-	defer dstFile.Close()
-
-	// Stream file data from the form upload straight to disk
-	_, err = io.Copy(dstFile, file)
-	if err != nil {
-		respondWithError(w, http.StatusInternalServerError, "Error saving file content to disk", err)
-		return
-	}
-
-	// Update the database record with the new static assets asset URL
-	thumbnailURL := fmt.Sprintf("http://localhost:%s/assets/%s", cfg.port, fileName)
-	video.ThumbnailURL = &thumbnailURL
-
+	url := cfg.getAssetURL(assetPath)
+	video.ThumbnailURL = &url
 	err = cfg.db.UpdateVideo(video)
 	if err != nil {
-		respondWithError(w, http.StatusInternalServerError, "Couldn't update video record", err)
+		respondWithError(w, http.StatusInternalServerError, "Couldn't update video", err)
 		return
 	}
 
