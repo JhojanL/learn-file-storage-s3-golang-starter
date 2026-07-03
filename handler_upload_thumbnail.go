@@ -2,6 +2,7 @@ package main
 
 import (
 	"io"
+	"mime"
 	"net/http"
 	"os"
 
@@ -45,8 +46,21 @@ func (cfg *apiConfig) handlerUploadThumbnail(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	// Parse the media type to clean it (strips parameters like charset)
+	parsedMediaType, _, err := mime.ParseMediaType(mediaType)
+	if err != nil {
+		respondWithError(w, http.StatusBadRequest, "Invalid Content-Type header", err)
+		return
+	}
+
+	// Validate that the file is strictly a JPEG or PNG image
+	if parsedMediaType != "image/jpeg" && parsedMediaType != "image/png" {
+		respondWithError(w, http.StatusBadRequest, "Unsupported media type: only JPEG and PNG are allowed", nil)
+		return
+	}
+
 	// Use the safer parsing tool integrated into the asset helper
-	assetPath, err := getAssetPath(videoID, mediaType)
+	assetPath, err := getAssetPath(videoID, parsedMediaType)
 	if err != nil {
 		respondWithError(w, http.StatusBadRequest, "Invalid media type or extension", err)
 		return
