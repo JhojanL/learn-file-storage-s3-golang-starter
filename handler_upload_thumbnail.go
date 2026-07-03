@@ -1,10 +1,13 @@
 package main
 
 import (
-	"encoding/base64"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
 
 	"github.com/bootdotdev/learn-file-storage-s3-golang-starter/internal/auth"
 	"github.com/google/uuid"
@@ -31,7 +34,11 @@ func (cfg *apiConfig) handlerUploadThumbnail(w http.ResponseWriter, r *http.Requ
 	}
 
 	const maxMemory = 10 << 20 // 10 MB
-	r.ParseMultipartForm(maxMemory)
+	err = r.ParseMultipartForm(maxMemory)
+	if err != nil {
+		respondWithError(w, http.StatusBadRequest, "Unable to parse multipart form", err)
+		return
+	}
 
 	file, header, err := r.FormFile("thumbnail")
 	if err != nil {
@@ -40,17 +47,21 @@ func (cfg *apiConfig) handlerUploadThumbnail(w http.ResponseWriter, r *http.Requ
 	}
 	defer file.Close()
 
-	mediaType := header.Header.Get("Content-Type")
-	if mediaType == "" {
-		respondWithError(w, http.StatusBadRequest, "Missing Content-Type for thumbnail", nil)
+	// Parse the Content-Type header to ignore optional parameters like charsets
+	mediaType, _, err := mime.ParseMediaType(header.Header.Get("Content-Type"))
+	if err != nil {
+		respondWithError(w, http.StatusBadRequest, "Invalid Content-Type header", err)
 		return
 	}
 
-	data, err := io.ReadAll(file)
-	if err != nil {
-		respondWithError(w, http.StatusInternalServerError, "Error reading file", err)
+	// Determine the corresponding file extensions for the media type
+	extensions, err := mime.ExtensionsByType(mediaType)
+	if err != nil || len(extensions) == 0 {
+		respondWithError(w, http.StatusBadRequest, "Unsupported media type extension", err)
 		return
 	}
+	// Take the first matching extension and remove the leading dot if present
+	fileExt := strings.TrimPrefix(extensions[0], ".")
 
 	video, err := cfg.db.GetVideo(videoID)
 	if err != nil {
@@ -62,17 +73,32 @@ func (cfg *apiConfig) handlerUploadThumbnail(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	// Encode the image byte slice to a base64 string
-	encodedData := base64.StdEncoding.EncodeToString(data)
+	// Construct the unique local disk file path
+	fileName := fmt.Sprintf("%s.%s", videoID, fileExt)
+	filePath := filepath.Join(cfg.assetsRoot, fileName)
 
-	// Format the string as a standalone Data URL
-	dataURL := fmt.Sprintf("data:%s;base64,%s", mediaType, encodedData)
-	video.ThumbnailURL = &dataURL
+	// Create the empty file on disk
+	dstFile, err := os.Create(filePath)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Unable to create file on disk", err)
+		return
+	}
+	defer dstFile.Close()
 
-	// Persist the data URL directly into the SQLite database record
+	// Stream file data from the form upload straight to disk
+	_, err = io.Copy(dstFile, file)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Error saving file content to disk", err)
+		return
+	}
+
+	// Update the database record with the new static assets asset URL
+	thumbnailURL := fmt.Sprintf("http://localhost:%s/assets/%s", cfg.port, fileName)
+	video.ThumbnailURL = &thumbnailURL
+
 	err = cfg.db.UpdateVideo(video)
 	if err != nil {
-		respondWithError(w, http.StatusInternalServerError, "Couldn't update video", err)
+		respondWithError(w, http.StatusInternalServerError, "Couldn't update video record", err)
 		return
 	}
 
