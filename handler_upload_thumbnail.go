@@ -59,10 +59,10 @@ func (cfg *apiConfig) handlerUploadThumbnail(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	// Use the safer parsing tool integrated into the asset helper
-	assetPath, err := getAssetPath(videoID, parsedMediaType)
+	// Generate a random asset path using the updated assets helper
+	assetPath, err := getRandomAssetPath(parsedMediaType)
 	if err != nil {
-		respondWithError(w, http.StatusBadRequest, "Invalid media type or extension", err)
+		respondWithError(w, http.StatusInternalServerError, "Couldn't generate asset path", err)
 		return
 	}
 	assetDiskPath := cfg.getAssetDiskPath(assetPath)
