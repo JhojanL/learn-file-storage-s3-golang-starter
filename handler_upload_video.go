@@ -1,18 +1,66 @@
 package main
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"mime"
 	"net/http"
 	"os"
+	"os/exec"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/bootdotdev/learn-file-storage-s3-golang-starter/internal/auth"
 	"github.com/google/uuid"
 )
+
+type ffProbeResult struct {
+	Streams []struct {
+		Width  int `json:"width"`
+		Height int `json:"height"`
+	} `json:"streams"`
+}
+
+func getVideoAspectRatio(filePath string) (string, error) {
+	cmd := exec.Command("ffprobe", "-v", "error", "-print_format", "json", "-show_streams", filePath)
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+
+	if err := cmd.Run(); err != nil {
+		return "", err
+	}
+
+	var result ffProbeResult
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+		return "", err
+	}
+
+	if len(result.Streams) == 0 {
+		return "", fmt.Errorf("no video streams found")
+	}
+
+	width := result.Streams[0].Width
+	height := result.Streams[0].Height
+
+	if height == 0 {
+		return "", fmt.Errorf("video height is zero")
+	}
+
+	ratio := float64(width) / float64(height)
+	const tolerance = 0.01
+
+	if math.Abs(ratio-(16.0/9.0)) < tolerance {
+		return "16:9", nil
+	}
+	if math.Abs(ratio-(9.0/16.0)) < tolerance {
+		return "9:16", nil
+	}
+	return "other", nil
+}
 
 func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request) {
 	const maxUploadSize = 1 << 30 // 1 GB
@@ -90,13 +138,29 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	aspectRatio, err := getVideoAspectRatio(tempFile.Name())
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Error determining video aspect ratio", err)
+		return
+	}
+
+	var prefix string
+	switch aspectRatio {
+	case "16:9":
+		prefix = "landscape/"
+	case "9:16":
+		prefix = "portrait/"
+	default:
+		prefix = "other/"
+	}
+
 	cryptoBuf := make([]byte, 16)
 	_, err = rand.Read(cryptoBuf)
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Error generating random key name", err)
 		return
 	}
-	key := fmt.Sprintf("%s.mp4", hex.EncodeToString(cryptoBuf))
+	key := fmt.Sprintf("%s%s.mp4", prefix, hex.EncodeToString(cryptoBuf))
 
 	_, err = cfg.s3Client.PutObject(r.Context(), &s3.PutObjectInput{
 		Bucket:      &cfg.s3Bucket,
