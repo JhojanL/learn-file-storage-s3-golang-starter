@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -12,9 +13,12 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/bootdotdev/learn-file-storage-s3-golang-starter/internal/auth"
+	"github.com/bootdotdev/learn-file-storage-s3-golang-starter/internal/database"
 	"github.com/google/uuid"
 )
 
@@ -23,53 +27,6 @@ type ffProbeResult struct {
 		Width  int `json:"width"`
 		Height int `json:"height"`
 	} `json:"streams"`
-}
-
-func getVideoAspectRatio(filePath string) (string, error) {
-	cmd := exec.Command("ffprobe", "-v", "error", "-print_format", "json", "-show_streams", filePath)
-	var stdout bytes.Buffer
-	cmd.Stdout = &stdout
-
-	if err := cmd.Run(); err != nil {
-		return "", err
-	}
-
-	var result ffProbeResult
-	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
-		return "", err
-	}
-
-	if len(result.Streams) == 0 {
-		return "", fmt.Errorf("no video streams found")
-	}
-
-	width := result.Streams[0].Width
-	height := result.Streams[0].Height
-
-	if height == 0 {
-		return "", fmt.Errorf("video height is zero")
-	}
-
-	ratio := float64(width) / float64(height)
-	const tolerance = 0.01
-
-	if math.Abs(ratio-(16.0/9.0)) < tolerance {
-		return "16:9", nil
-	}
-	if math.Abs(ratio-(9.0/16.0)) < tolerance {
-		return "9:16", nil
-	}
-	return "other", nil
-}
-
-func processVideoForFastStart(filePath string) (string, error) {
-	outputPath := filePath + ".processing"
-	cmd := exec.Command("ffmpeg", "-i", filePath, "-c", "copy", "-movflags", "faststart", "-f", "mp4", outputPath)
-
-	if err := cmd.Run(); err != nil {
-		return "", err
-	}
-	return outputPath, nil
 }
 
 func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request) {
@@ -193,7 +150,7 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	videoURL := fmt.Sprintf("https://%s.s3.%s.amazonaws.com/%s", cfg.s3Bucket, cfg.s3Region, key)
+	videoURL := fmt.Sprintf("%s,%s", cfg.s3Bucket, key)
 	video.VideoURL = &videoURL
 
 	err = cfg.db.UpdateVideo(video)
@@ -202,5 +159,92 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	respondWithJSON(w, http.StatusOK, video)
+	signedVideo, err := cfg.dbVideoToSignedVideo(video)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Error generating presigned URL", err)
+		return
+	}
+
+	respondWithJSON(w, http.StatusOK, signedVideo)
+}
+
+func getVideoAspectRatio(filePath string) (string, error) {
+	cmd := exec.Command("ffprobe", "-v", "error", "-print_format", "json", "-show_streams", filePath)
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+
+	if err := cmd.Run(); err != nil {
+		return "", err
+	}
+
+	var result ffProbeResult
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+		return "", err
+	}
+
+	if len(result.Streams) == 0 {
+		return "", fmt.Errorf("no video streams found")
+	}
+
+	width := result.Streams[0].Width
+	height := result.Streams[0].Height
+
+	if height == 0 {
+		return "", fmt.Errorf("video height is zero")
+	}
+
+	ratio := float64(width) / float64(height)
+	const tolerance = 0.01
+
+	if math.Abs(ratio-(16.0/9.0)) < tolerance {
+		return "16:9", nil
+	}
+	if math.Abs(ratio-(9.0/16.0)) < tolerance {
+		return "9:16", nil
+	}
+	return "other", nil
+}
+
+func processVideoForFastStart(filePath string) (string, error) {
+	outputPath := filePath + ".processing"
+	cmd := exec.Command("ffmpeg", "-i", filePath, "-c", "copy", "-movflags", "faststart", "-f", "mp4", outputPath)
+
+	if err := cmd.Run(); err != nil {
+		return "", err
+	}
+	return outputPath, nil
+}
+
+func generatePresignedURL(s3Client *s3.Client, bucket, key string, expireTime time.Duration) (string, error) {
+	presignClient := s3.NewPresignClient(s3Client)
+	req, err := presignClient.PresignGetObject(context.Background(), &s3.GetObjectInput{
+		Bucket: &bucket,
+		Key:    &key,
+	}, s3.WithPresignExpires(expireTime))
+	if err != nil {
+		return "", err
+	}
+	return req.URL, nil
+}
+
+func (cfg *apiConfig) dbVideoToSignedVideo(video database.Video) (database.Video, error) {
+	if video.VideoURL == nil {
+		return video, nil
+	}
+
+	parts := strings.Split(*video.VideoURL, ",")
+	if len(parts) < 2 {
+		return video, nil
+	}
+
+	bucket := parts[0]
+	key := parts[1]
+
+	presignedURL, err := generatePresignedURL(cfg.s3Client, bucket, key, 1*time.Hour)
+	if err != nil {
+		return video, err
+	}
+
+	video.VideoURL = &presignedURL
+	return video, nil
 }
